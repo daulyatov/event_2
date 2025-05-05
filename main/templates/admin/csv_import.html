@@ -1,0 +1,35 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block content %}
+<div id="content-main">
+    <h1>{% trans "Import Events from CSV" %}</h1>
+    <p>{% trans "Please upload a CSV file with the following columns:" %}</p>
+    <ul>
+        <li>name (required) - название мероприятия</li>
+        <li>location (required) - место проведения</li>
+        <li>address (required) - адрес</li>
+        <li>event_type (required: online, offline, hybrid) - тип мероприятия</li>
+        <li>category (required: concert, meeting, marathon, training) - категория</li>
+        <li>date_time (required, format: YYYY-MM-DD HH:MM:SS) - дата и время</li>
+        <li>details (optional) - описание</li>
+        <li>link_2gis (optional) - ссылка на 2ГИС</li>
+        <li>is_private (optional, true/false) - приватное ли мероприятие</li>
+        <li>channel_name (optional) - название канала для приватных мероприятий</li>
+    </ul>
+    <div class="help">
+        <p><strong>Примечание:</strong> Для приватных мероприятий (is_private = true) рекомендуется указывать название канала в поле channel_name. 
+        Канал должен быть предварительно создан в системе.</p>
+    </div>
+    <form method="post" enctype="multipart/form-data">
+        {% csrf_token %}
+        <div>
+            <input type="file" name="csv_file" accept=".csv" required>
+        </div>
+        <div style="margin-top: 20px;">
+            <input type="submit" value="{% trans 'Import' %}" class="default">
+            <a href=".." class="button cancel-link">{% trans "Cancel" %}</a>
+        </div>
+    </form>
+</div>
+{% endblock %} 
