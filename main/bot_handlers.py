@@ -23,6 +23,7 @@ from django.core.cache import cache
 import threading
 import time
 from functools import lru_cache
+from django.db.models import Q
 
 # Настройка логирования
 logging.basicConfig(
@@ -154,6 +155,24 @@ def handle_error(chat_id, error_message, original_message=None):
     bot.send_message(chat_id, "Произошла ошибка. Пожалуйста, попробуйте позже или обратитесь к администратору.")
     bot.send_message(chat_id, "Выбери тип мероприятия:", reply_markup=main_menu_keyboard())
 
+def safe_delete_last_message(chat_id, user_id):
+    state = get_user_state(user_id)
+    if state and state.get('last_message_id'):
+        try:
+            bot.delete_message(chat_id, state['last_message_id'])
+        except Exception:
+            pass
+
+def send_and_store_message(chat_id, user_id, *args, keep_message=False, **kwargs):
+    if not keep_message:
+        safe_delete_last_message(chat_id, user_id)
+    msg = bot.send_message(chat_id, *args, **kwargs)
+    if not keep_message:
+        state = get_user_state(user_id) or {}
+        state['last_message_id'] = msg.message_id
+        update_user_state(user_id, state)
+    return msg
+
 @bot.message_handler(commands=["start"])
 def start(message: Message):
     try:
@@ -166,8 +185,8 @@ def start(message: Message):
             )
         text = f"Привет, {username or 'пользователь'}! 🎉 Ты зарегистрирован в системе." if created else \
                f"С возвращением, {username or 'пользователь'}! 🔥"
-        bot.send_message(message.chat.id, text)
-        bot.send_message(message.chat.id, "Выбери тип мероприятия:", reply_markup=main_menu_keyboard())
+        send_and_store_message(message.chat.id, message.from_user.id, text, keep_message=True)
+        send_and_store_message(message.chat.id, message.from_user.id, "Выбери тип мероприятия:", reply_markup=main_menu_keyboard())
         logger.info(f"User {telegram_id} started the bot")
     except Exception as e:
         handle_error(message.chat.id, str(e), message.text)
@@ -175,11 +194,14 @@ def start(message: Message):
 @bot.callback_query_handler(func=lambda call: call.data == "back_main")
 def back_to_main(call: CallbackQuery):
     try:
-        # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        # Send new main menu
-        bot.send_message(
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
+        # Очистить список мероприятий из состояния
+        state = get_user_state(call.from_user.id) or {}
+        state.pop('events', None)
+        update_user_state(call.from_user.id, state)
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             "Выберите тип мероприятия:",
             reply_markup=main_menu_keyboard()
         )
@@ -190,10 +212,11 @@ def back_to_main(call: CallbackQuery):
 def select_event_type(call: CallbackQuery):
     try:
         # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         event_type = call.data.split("_")[2]
-        bot.send_message(
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             f"Выберите категорию для {event_type} мероприятий:",
             reply_markup=category_keyboard(event_type)
         )
@@ -203,20 +226,28 @@ def select_event_type(call: CallbackQuery):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("category_"))
 def select_category(call: CallbackQuery):
     try:
-        # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         event_type = call.data.split("_")[1]
         category = call.data.split("_")[2]
-        events = get_cached_events(event_type, category)
-        
+        user = User.objects.get(telegram_id=str(call.from_user.id))
+        # Исключаем мероприятия, на которые пользователь уже записан
+        attending_events = set(Event.objects.filter(
+            attendance__user=user,
+            attendance__status="going"
+        ).values_list('id', flat=True))
+        events = list(Event.objects.filter(
+            event_type=event_type,
+            category=category,
+            date_time__gte=datetime.now()
+        ).exclude(id__in=attending_events).order_by("date_time"))
         if not events:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 "На данный момент нет доступных мероприятий в этой категории.",
                 reply_markup=back_to_main_menu_keyboard()
             )
             return
-
         message = f"Доступные {category} мероприятия ({event_type}):\n\n"
         for i, event in enumerate(events, 1):
             message += f"{i}. {event.name}\n"
@@ -227,9 +258,13 @@ def select_category(call: CallbackQuery):
             if event.link_2gis:
                 message += f"   🗺️ {event.link_2gis}\n"
             message += "\n"
-
-        bot.send_message(
+        # Save events in state
+        state = get_user_state(call.from_user.id) or {}
+        state["events"] = events
+        update_user_state(call.from_user.id, state)
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             message,
             reply_markup=back_to_main_menu_keyboard()
         )
@@ -239,9 +274,7 @@ def select_category(call: CallbackQuery):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("going_"))
 def mark_attendance(call: CallbackQuery):
     try:
-        # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         event_id = call.data.replace("going_", "")
         with transaction.atomic():
             user = User.objects.get(telegram_id=str(call.from_user.id))
@@ -251,12 +284,9 @@ def mark_attendance(call: CallbackQuery):
                 event=event,
                 defaults={"status": "going"}
             )
-        
-        # Инвалидация кэша
         invalidate_user_events_cache(user.telegram_id, "going")
-        
-        bot.send_message(call.message.chat.id, "✅ Ты отметил своё участие.")
-        bot.send_message(call.message.chat.id, "Выбери тип мероприятия:", reply_markup=main_menu_keyboard())
+        send_and_store_message(call.message.chat.id, call.from_user.id, "✅ Ты отметил своё участие.", keep_message=True)
+        send_and_store_message(call.message.chat.id, call.from_user.id, "Выбери тип мероприятия:", reply_markup=main_menu_keyboard())
         logger.info(f"User {call.from_user.id} marked attendance for event {event_id}")
     except ObjectDoesNotExist:
         handle_error(call.message.chat.id, "Мероприятие или пользователь не найдены", call.data)
@@ -267,7 +297,7 @@ def mark_attendance(call: CallbackQuery):
 def edit_status(call: CallbackQuery):
     try:
         # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         
         _, _, action, event_id = call.data.split("_", 3)
         user = User.objects.get(telegram_id=str(call.from_user.id))
@@ -276,7 +306,7 @@ def edit_status(call: CallbackQuery):
             try:
                 attendance = Attendance.objects.get(user=user, event__id=event_id)
             except Attendance.DoesNotExist:
-                bot.send_message(call.message.chat.id, "Участие не найдено.")
+                send_and_store_message(call.message.chat.id, call.from_user.id, "Участие не найдено.")
                 return
 
             if action == "going":
@@ -288,7 +318,7 @@ def edit_status(call: CallbackQuery):
                 invalidate_user_events_cache(user.telegram_id, "going")
                 invalidate_user_events_cache(user.telegram_id, old_status)
                 
-                bot.send_message(call.message.chat.id, "✅ Статус обновлён на 'Иду'.", 
+                send_and_store_message(call.message.chat.id, call.from_user.id, "✅ Статус обновлён на 'Иду'.", 
                                reply_markup=main_menu_keyboard())
             elif action == "delete":
                 old_status = attendance.status
@@ -297,9 +327,9 @@ def edit_status(call: CallbackQuery):
                 # Инвалидация кэша
                 invalidate_user_events_cache(user.telegram_id, old_status)
                 
-                bot.send_message(call.message.chat.id, "🗑 Участие удалено.", reply_markup=main_menu_keyboard())
+                send_and_store_message(call.message.chat.id, call.from_user.id, "🗑 Участие удалено.", reply_markup=main_menu_keyboard())
             else:
-                bot.send_message(call.message.chat.id, "Неизвестное действие.")
+                send_and_store_message(call.message.chat.id, call.from_user.id, "Неизвестное действие.")
         
         logger.info(f"User {call.from_user.id} {action}ed attendance for event {event_id}")
     except Exception as e:
@@ -309,13 +339,13 @@ def edit_status(call: CallbackQuery):
 def show_maybe_categories(call: CallbackQuery):
     try:
         # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         
         user = User.objects.get(telegram_id=str(call.from_user.id))
         events = get_cached_user_events(call.from_user.id, "maybe")
 
         if not events:
-            bot.send_message(call.message.chat.id, "У тебя нет неопределённых мероприятий.", reply_markup=back_to_main_menu_keyboard())
+            send_and_store_message(call.message.chat.id, call.from_user.id, "У тебя нет неопределённых мероприятий.", reply_markup=back_to_main_menu_keyboard())
             return
 
         # Группируем мероприятия по категориям
@@ -332,7 +362,7 @@ def show_maybe_categories(call: CallbackQuery):
             markup.add(InlineKeyboardButton(f"{display}", callback_data=f"maybe_cat_{category}"))
         markup.add(InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
         
-        bot.send_message(call.message.chat.id, "Выбери категорию мероприятия:", reply_markup=markup)
+        send_and_store_message(call.message.chat.id, call.from_user.id, "Выбери категорию мероприятия:", reply_markup=markup)
         logger.info(f"User {call.from_user.id} viewed maybe events categories")
     except Exception as e:
         handle_error(call.message.chat.id, str(e), call.data)
@@ -341,14 +371,15 @@ def show_maybe_categories(call: CallbackQuery):
 def maybe_category_events(call: CallbackQuery):
     try:
         # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         
         category = call.data.replace("maybe_cat_", "")
         events = get_cached_user_events(call.from_user.id, "maybe")
         
         if not events:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 "У вас нет мероприятий в этой категории.",
                 reply_markup=back_to_main_menu_keyboard()
             )
@@ -358,8 +389,9 @@ def maybe_category_events(call: CallbackQuery):
         category_events = [event for event in events if event.category == category]
         
         if not category_events:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 "У вас нет мероприятий в этой категории.",
                 reply_markup=back_to_main_menu_keyboard()
             )
@@ -380,8 +412,9 @@ def maybe_category_events(call: CallbackQuery):
         state["events"] = category_events
         update_user_state(call.from_user.id, state)
 
-        bot.send_message(
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             message,
             reply_markup=back_to_main_menu_keyboard()
         )
@@ -396,7 +429,7 @@ def handle_event_number(message: Message):
         state = get_user_state(user_id)
         
         if not state:
-            bot.send_message(message.chat.id, "Произошла ошибка. Пожалуйста, начните сначала.", reply_markup=main_menu_keyboard())
+            send_and_store_message(message.chat.id, message.from_user.id, "Произошла ошибка. Пожалуйста, начните сначала.", reply_markup=main_menu_keyboard())
             return
 
         events = None
@@ -404,11 +437,11 @@ def handle_event_number(message: Message):
             events = state["events"]
         
         if not events:
-            bot.send_message(message.chat.id, "Пожалуйста, выберите мероприятие из списка.", reply_markup=back_to_main_menu_keyboard())
+            send_and_store_message(message.chat.id, message.from_user.id, "Пожалуйста, выберите мероприятие из списка.", reply_markup=back_to_main_menu_keyboard())
             return
 
         if number < 1 or number > len(events):
-            bot.send_message(message.chat.id, f"Пожалуйста, выберите номер от 1 до {len(events)}.")
+            send_and_store_message(message.chat.id, message.from_user.id, f"Пожалуйста, выберите номер от 1 до {len(events)}.")
             return
 
         event = events[number - 1]
@@ -429,27 +462,28 @@ def handle_event_number(message: Message):
         except Attendance.DoesNotExist:
             markup = attendance_keyboard(event.id)
 
-        bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+        send_and_store_message(message.chat.id, message.from_user.id, text, reply_markup=markup, parse_mode="HTML")
     except Exception as e:
         handle_error(message.chat.id, str(e), message.text)
 
 @bot.message_handler(func=lambda message: True)
 def fallback_handler(message: Message):
-    bot.send_message(message.chat.id, "⛔️ Неизвестная команда. Пожалуйста, выбери действие с клавиатуры.")
-    bot.send_message(message.chat.id, "Выбери тип мероприятия:", reply_markup=main_menu_keyboard())
+    send_and_store_message(message.chat.id, message.from_user.id, "⛔️ Неизвестная команда. Пожалуйста, выбери действие с клавиатуры.")
+    send_and_store_message(message.chat.id, message.from_user.id, "Выбери тип мероприятия:", reply_markup=main_menu_keyboard())
 
 @bot.callback_query_handler(func=lambda call: call.data == "my_events")
 def show_my_events_categories(call: CallbackQuery):
     try:
         # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         
         # Get user's events
         events = get_cached_user_events(call.from_user.id, "going")
         
         if not events:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 "У вас пока нет мероприятий, на которые вы идёте.",
                 reply_markup=back_to_main_menu_keyboard()
             )
@@ -469,8 +503,9 @@ def show_my_events_categories(call: CallbackQuery):
             markup.add(InlineKeyboardButton(display, callback_data=f"my_cat_{category}"))
         markup.add(InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
         
-        bot.send_message(
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             "Выберите категорию ваших мероприятий:",
             reply_markup=markup
         )
@@ -481,14 +516,15 @@ def show_my_events_categories(call: CallbackQuery):
 def show_my_category_events(call: CallbackQuery):
     try:
         # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         
         category = call.data.split("_")[2]
         events = get_cached_user_events(call.from_user.id, "going")
         
         if not events:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 "У вас нет мероприятий в этой категории.",
                 reply_markup=back_to_main_menu_keyboard()
             )
@@ -497,8 +533,9 @@ def show_my_category_events(call: CallbackQuery):
         category_events = [event for event in events if event.category == category]
         
         if not category_events:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 "У вас нет мероприятий в этой категории.",
                 reply_markup=back_to_main_menu_keyboard()
             )
@@ -520,8 +557,9 @@ def show_my_category_events(call: CallbackQuery):
         state["events"] = category_events
         update_user_state(call.from_user.id, state)
 
-        bot.send_message(
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             message,
             reply_markup=back_to_main_menu_keyboard()
         )
@@ -535,21 +573,24 @@ def handle_buy_ticket(call: CallbackQuery):
         event = Event.objects.get(id=event_id)
         
         if event.ticket_link:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 f"🎫 Ссылка для покупки билета: {event.ticket_link}",
                 reply_markup=back_to_main_menu_keyboard()
             )
         else:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 "К сожалению, ссылка на покупку билета пока недоступна.",
                 reply_markup=back_to_main_menu_keyboard()
             )
     except Exception as e:
         logger.error(f"Error in handle_buy_ticket: {str(e)}")
-        bot.send_message(
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             "Произошла ошибка. Пожалуйста, попробуйте позже.",
             reply_markup=back_to_main_menu_keyboard()
         )
@@ -557,33 +598,30 @@ def handle_buy_ticket(call: CallbackQuery):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_attendance_"))
 def handle_cancel_attendance(call: CallbackQuery):
     try:
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         event_id = call.data.replace("cancel_attendance_", "")
         user = User.objects.get(telegram_id=str(call.from_user.id))
         event = Event.objects.get(id=event_id)
-        
-        # Удаляем запись о посещении
         Attendance.objects.filter(user=user, event=event).delete()
-        
-        # Инвалидируем кэш
         invalidate_user_events_cache(user.telegram_id, "going")
-        
-        # Получаем состояние пользователя
-        state = get_user_state(call.from_user.id)
-        if state and "my_events" in state:
-            # Удаляем мероприятие из списка моих мероприятий в состоянии
-            state["my_events"] = [e for e in state["my_events"] if e.id != int(event_id)]
-            update_user_state(call.from_user.id, state)
-        
-        bot.send_message(
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             "❌ Ты отменил своё участие в мероприятии.",
+            keep_message=True
+        )
+        send_and_store_message(
+            call.message.chat.id,
+            call.from_user.id,
+            "Выбери тип мероприятия:",
             reply_markup=main_menu_keyboard()
         )
         logger.info(f"User {call.from_user.id} cancelled attendance for event {event_id}")
     except Exception as e:
         logger.error(f"Error in handle_cancel_attendance: {str(e)}")
-        bot.send_message(
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             "Произошла ошибка при отмене участия. Пожалуйста, попробуйте позже.",
             reply_markup=back_to_main_menu_keyboard()
         )
@@ -592,18 +630,20 @@ def handle_cancel_attendance(call: CallbackQuery):
 def show_private_channels(call: CallbackQuery):
     try:
         # Delete the current message
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        safe_delete_last_message(call.message.chat.id, call.from_user.id)
         channels = TelegramChannel.objects.all()
         if not channels:
-            bot.send_message(
+            send_and_store_message(
                 call.message.chat.id,
+                call.from_user.id,
                 "Нет доступных приватных каналов.",
                 reply_markup=back_to_main_menu_keyboard()
             )
             return
 
-        bot.send_message(
+        send_and_store_message(
             call.message.chat.id,
+            call.from_user.id,
             "Выберите приватный канал:",
             reply_markup=private_channels_keyboard(channels)
         )
@@ -631,7 +671,7 @@ def show_private_channel_events(call: CallbackQuery):
         ).exclude(id__in=attending_events).order_by("date_time")
         
         if not events:
-            bot.send_message(call.message.chat.id, f"В канале {channel.name} пока нет доступных мероприятий.", reply_markup=back_to_main_menu_keyboard())
+            send_and_store_message(call.message.chat.id, call.from_user.id, f"В канале {channel.name} пока нет доступных мероприятий.", reply_markup=back_to_main_menu_keyboard())
             return
             
         # Группируем мероприятия по типам
@@ -654,7 +694,7 @@ def show_private_channel_events(call: CallbackQuery):
         state["private_events"] = {et: list(evs) for et, evs in event_types.items()}
         update_user_state(call.from_user.id, state)
         
-        bot.send_message(call.message.chat.id, f"Выбери тип мероприятия в канале {channel.name}:", reply_markup=markup)
+        send_and_store_message(call.message.chat.id, call.from_user.id, f"Выбери тип мероприятия в канале {channel.name}:", reply_markup=markup)
     except Exception as e:
         handle_error(call.message.chat.id, str(e), call.data)
 
@@ -667,14 +707,14 @@ def show_private_type_categories(call: CallbackQuery):
         # Get state
         state = get_user_state(call.from_user.id)
         if not state or "private_events" not in state:
-            bot.send_message(call.message.chat.id, "Произошла ошибка. Пожалуйста, начните сначала.", reply_markup=main_menu_keyboard())
+            send_and_store_message(call.message.chat.id, call.from_user.id, "Произошла ошибка. Пожалуйста, начните сначала.", reply_markup=main_menu_keyboard())
             return
             
         # Get events for this type
         events = state["private_events"].get(event_type, [])
         
         if not events:
-            bot.send_message(call.message.chat.id, f"В канале {channel.name} нет мероприятий типа {dict(Event.EVENT_TYPE_CHOICES).get(event_type, event_type)}.", reply_markup=back_to_main_menu_keyboard())
+            send_and_store_message(call.message.chat.id, call.from_user.id, f"В канале {channel.name} нет мероприятий типа {dict(Event.EVENT_TYPE_CHOICES).get(event_type, event_type)}.", reply_markup=back_to_main_menu_keyboard())
             return
             
         # Группируем мероприятия по категориям
@@ -696,7 +736,7 @@ def show_private_type_categories(call: CallbackQuery):
         state["private_events_by_category"] = {cat: list(evs) for cat, evs in categories.items()}
         update_user_state(call.from_user.id, state)
         
-        bot.send_message(call.message.chat.id, f"Выбери категорию мероприятий:", reply_markup=markup)
+        send_and_store_message(call.message.chat.id, call.from_user.id, f"Выбери категорию мероприятий:", reply_markup=markup)
     except Exception as e:
         handle_error(call.message.chat.id, str(e), call.data)
 
@@ -709,14 +749,14 @@ def show_private_category_events(call: CallbackQuery):
         # Get state
         state = get_user_state(call.from_user.id)
         if not state or "private_events_by_category" not in state:
-            bot.send_message(call.message.chat.id, "Произошла ошибка. Пожалуйста, начните сначала.", reply_markup=main_menu_keyboard())
+            send_and_store_message(call.message.chat.id, call.from_user.id, "Произошла ошибка. Пожалуйста, начните сначала.", reply_markup=main_menu_keyboard())
             return
             
         # Get events for this category
         events = state["private_events_by_category"].get(category, [])
         
         if not events:
-            bot.send_message(call.message.chat.id, f"В канале {channel.name} нет мероприятий категории {dict(Event.CATEGORY_CHOICES).get(category, category)}.", reply_markup=back_to_main_menu_keyboard())
+            send_and_store_message(call.message.chat.id, call.from_user.id, f"В канале {channel.name} нет мероприятий категории {dict(Event.CATEGORY_CHOICES).get(category, category)}.", reply_markup=back_to_main_menu_keyboard())
             return
             
         # Save events in state
@@ -725,7 +765,7 @@ def show_private_category_events(call: CallbackQuery):
         update_user_state(call.from_user.id, state)
         
         # Format events list
-        text = f"📋 Мероприятия канала {channel.name} ({dict(Event.EVENT_TYPE_CHOICES).get(event_type, event_type)}, {dict(Event.CATEGORY_CHOICES).get(category, category)}):\n\n"
+        text = f"Мероприятия канала {channel.name} ({dict(Event.EVENT_TYPE_CHOICES).get(event_type, event_type)}, {dict(Event.CATEGORY_CHOICES).get(category, category)}):\n\n"
         for i, event in enumerate(events, 1):
             weekday = calendar.day_name[event.date_time.weekday()]
             ru_day = {'Saturday': 'Сб', 'Sunday': 'Вс'}.get(weekday, '')
@@ -734,7 +774,7 @@ def show_private_category_events(call: CallbackQuery):
             text += f"{i}. {date_str} - {event.name}\n"
         text += "\nНапиши номер мероприятия, чтобы получить подробности."
         
-        bot.send_message(call.message.chat.id, text, reply_markup=back_to_main_menu_keyboard())
+        send_and_store_message(call.message.chat.id, call.from_user.id, text, reply_markup=back_to_main_menu_keyboard())
     except Exception as e:
         handle_error(call.message.chat.id, str(e), call.data)
 
