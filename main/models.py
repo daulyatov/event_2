@@ -41,6 +41,7 @@ class Event(models.Model):
     date_time = models.DateTimeField()
     details = models.TextField(blank=True, null=True)
     link_2gis = models.URLField(blank=True, null=True)
+    # ticket_link = models.URLField(blank=True, null=True)  # Ссылка для покупки билета
     created_at = models.DateTimeField(auto_now_add=True)
     is_private = models.BooleanField(default=False)
     channel = models.ForeignKey(TelegramChannel, on_delete=models.SET_NULL, null=True, blank=True)

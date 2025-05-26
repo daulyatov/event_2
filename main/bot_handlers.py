@@ -566,34 +566,34 @@ def show_my_category_events(call: CallbackQuery):
     except Exception as e:
         handle_error(call.message.chat.id, str(e), call.message)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("buy_ticket_"))
-def handle_buy_ticket(call: CallbackQuery):
-    try:
-        event_id = call.data.replace("buy_ticket_", "")
-        event = Event.objects.get(id=event_id)
-        
-        if event.ticket_link:
-            send_and_store_message(
-                call.message.chat.id,
-                call.from_user.id,
-                f"🎫 Ссылка для покупки билета: {event.ticket_link}",
-                reply_markup=back_to_main_menu_keyboard()
-            )
-        else:
-            send_and_store_message(
-                call.message.chat.id,
-                call.from_user.id,
-                "К сожалению, ссылка на покупку билета пока недоступна.",
-                reply_markup=back_to_main_menu_keyboard()
-            )
-    except Exception as e:
-        logger.error(f"Error in handle_buy_ticket: {str(e)}")
-        send_and_store_message(
-            call.message.chat.id,
-            call.from_user.id,
-            "Произошла ошибка. Пожалуйста, попробуйте позже.",
-            reply_markup=back_to_main_menu_keyboard()
-        )
+# @bot.callback_query_handler(func=lambda call: call.data.startswith("buy_ticket_"))
+# def handle_buy_ticket(call: CallbackQuery):
+#     try:
+#         event_id = call.data.replace("buy_ticket_", "")
+#         event = Event.objects.get(id=event_id)
+#         
+#         if event.ticket_link:
+#             send_and_store_message(
+#                 call.message.chat.id,
+#                 call.from_user.id,
+#                 f"🎫 Ссылка для покупки билета: {event.ticket_link}",
+#                 reply_markup=back_to_main_menu_keyboard()
+#             )
+#         else:
+#             send_and_store_message(
+#                 call.message.chat.id,
+#                 call.from_user.id,
+#                 "К сожалению, ссылка на покупку билета пока недоступна.",
+#                 reply_markup=back_to_main_menu_keyboard()
+#             )
+#     except Exception as e:
+#         logger.error(f"Error in handle_buy_ticket: {str(e)}")
+#         send_and_store_message(
+#             call.message.chat.id,
+#             call.from_user.id,
+#             "Произошла ошибка. Пожалуйста, попробуйте позже.",
+#             reply_markup=back_to_main_menu_keyboard()
+#         )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("cancel_attendance_"))
 def handle_cancel_attendance(call: CallbackQuery):

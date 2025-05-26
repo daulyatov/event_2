@@ -56,7 +56,7 @@ def my_events_category_keyboard(categories):
 def my_event_actions_keyboard(event_id):
     markup = InlineKeyboardMarkup()
     markup.row(
-        InlineKeyboardButton("🎫 Купить билет", callback_data=f"buy_ticket_{event_id}"),
+        # InlineKeyboardButton("🎫 Купить билет", callback_data=f"buy_ticket_{event_id}"),
         InlineKeyboardButton("❌ Отменить участие", callback_data=f"cancel_attendance_{event_id}")
     )
     markup.add(InlineKeyboardButton("🔙 Назад", callback_data="my_events"))
